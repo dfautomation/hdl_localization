@@ -11,6 +11,7 @@
 #include <tf2_eigen/tf2_eigen.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <eigen_conversions/eigen_msg.h>
 
@@ -52,6 +53,9 @@ public:
 
     robot_odom_frame_id = private_nh.param<std::string>("robot_odom_frame_id", "robot_odom");
     odom_child_frame_id = private_nh.param<std::string>("odom_child_frame_id", "base_link");
+
+    // publish map->odom on /tf_static (re-sent on every update) instead of /tf
+    use_static_tf = private_nh.param<bool>("use_static_tf", false);
 
     use_imu = private_nh.param<bool>("use_imu", true);
     invert_acc = private_nh.param<bool>("invert_acc", false);
@@ -416,7 +420,11 @@ private:
       odom_trans.header.frame_id = "map";
       odom_trans.child_frame_id = robot_odom_frame_id;
 
-      tf_broadcaster.sendTransform(odom_trans);
+      if(use_static_tf) {
+        static_tf_broadcaster.sendTransform(odom_trans);
+      } else {
+        tf_broadcaster.sendTransform(odom_trans);
+      }
     } else {
       geometry_msgs::TransformStamped odom_trans = tf2::eigenToTransform(Eigen::Isometry3d(pose.cast<double>()));
       odom_trans.header.stamp = stamp;
@@ -524,6 +532,8 @@ private:
   tf2_ros::Buffer tf_buffer;
   tf2_ros::TransformListener tf_listener;
   tf2_ros::TransformBroadcaster tf_broadcaster;
+  tf2_ros::StaticTransformBroadcaster static_tf_broadcaster;
+  bool use_static_tf;
 
   // imu input buffer
   std::mutex imu_data_mutex;
