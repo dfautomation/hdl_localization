@@ -19,6 +19,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <nav_msgs/Odometry.h>
+#include <nav_msgs/SetMap.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 
 #include <pcl/filters/voxel_grid.h>
@@ -84,6 +85,9 @@ public:
 
       relocalize_server = nh.advertiseService("/relocalize", &HdlLocalizationNodelet::relocalize, this);
     }
+
+    // advertised last: its presence tells the caller that the nodelet is ready
+    set_map_server = nh.advertiseService("/set_map", &HdlLocalizationNodelet::set_map, this);
   }
 
 private:
@@ -186,7 +190,7 @@ private:
    */
   void points_callback(const sensor_msgs::PointCloud2ConstPtr& points_msg) {
     if(!globalmap) {
-      NODELET_ERROR("globalmap has not been received!!");
+      NODELET_ERROR_THROTTLE(10.0, "globalmap has not been received!!");
       return;
     }
 
@@ -223,7 +227,7 @@ private:
 
     std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
     if(!pose_estimator) {
-      NODELET_ERROR("waiting for initial pose input!!");
+      NODELET_ERROR_THROTTLE(10.0, "waiting for initial pose input!!");
       return;
     }
     Eigen::Matrix4f before = pose_estimator->matrix();
@@ -286,12 +290,36 @@ private:
    * @param points_msg
    */
   void globalmap_callback(const sensor_msgs::PointCloud2ConstPtr& points_msg) {
+    // same map as the one already loaded. The stamp names the raw map, not the cloud,
+    // so the size is compared too; a different cloud of the same size is still skipped.
+    if(globalmap && !points_msg->header.stamp.isZero() && points_msg->header.stamp == globalmap_stamp &&
+       static_cast<size_t>(points_msg->width) * points_msg->height == globalmap->size()) {
+      NODELET_INFO("globalmap unchanged, skipped");
+      return;
+    }
+
+    // an empty cloud means that the raw map has no 3D map: drop the loaded one
+    if(points_msg->width * points_msg->height == 0) {
+      NODELET_WARN("empty globalmap received: 3D map dropped");
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      pose_estimator.reset();  // holds the registration; stop matching first
+      globalmap.reset();
+      globalmap_stamp = points_msg->header.stamp;
+      registration = create_registration();  // frees the NDT target of the old cloud
+      return;
+    }
+
     NODELET_INFO("globalmap received!");
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
     pcl::fromROSMsg(*points_msg, *cloud);
-    globalmap = cloud;
-
-    registration->setInputTarget(globalmap);
+    {
+      // a scan may be being matched against the old map in points_callback
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      globalmap = cloud;
+      registration->setInputTarget(globalmap);
+    }
+    globalmap_stamp = points_msg->header.stamp;
+    apply_pending_pose();
 
     if(use_global_localization) {
       NODELET_INFO("set globalmap for global localization!");
@@ -360,6 +388,12 @@ private:
    * @param pose_msg
    */
   void initialpose_callback(const geometry_msgs::PoseWithCovarianceStampedConstPtr& pose_msg) {
+    // a pose from the topic while one from /set_map waits for its 3D map: it replaces the waiting one
+    if(pending_pose && pose_msg != pending_pose) {
+      NODELET_INFO("initial pose held until the 3D map of the raw map is loaded");
+      pending_pose = pose_msg;
+      return;
+    }
     NODELET_INFO("initial pose received!!");
     std::lock_guard<std::mutex> lock(pose_estimator_mutex);
     const auto& p = pose_msg->pose.pose.position;
@@ -371,6 +405,36 @@ private:
             Eigen::Quaternionf(q.w, q.x, q.y, q.z),
             private_nh.param<double>("cool_time_duration", 0.5))
     );
+  }
+
+  /**
+   * @brief the 2D map is ignored: the 3D map comes on /globalmap.
+   */
+  bool set_map(nav_msgs::SetMap::Request& req, nav_msgs::SetMap::Response& res) {
+    pending_pose = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(req.initial_pose);
+    pending_stamp = req.map.header.stamp;
+    {
+      std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      pose_estimator.reset();  // not localized until the pose is applied
+    }
+    apply_pending_pose();
+    res.success = true;  // accepted; applied once the matching 3D map is here
+    return true;
+  }
+
+  /**
+   * @brief the initial pose is applied only together with the 3D map of the same raw map (same stamp)
+   */
+  void apply_pending_pose() {
+    if(!pending_pose) {
+      return;
+    }
+    if(!globalmap || globalmap_stamp != pending_stamp) {
+      NODELET_WARN("initial pose is waiting for the 3D map of its raw map");
+      return;
+    }
+    initialpose_callback(pending_pose);
+    pending_pose.reset();
   }
 
   /**
@@ -524,6 +588,7 @@ private:
   ros::Subscriber points_sub;
   ros::Subscriber globalmap_sub;
   ros::Subscriber initialpose_sub;
+  ros::ServiceServer set_map_server;
 
   ros::Publisher pose_pub;
   ros::Publisher aligned_pub;
@@ -541,6 +606,11 @@ private:
 
   // globalmap and registration method
   pcl::PointCloud<PointT>::Ptr globalmap;
+  ros::Time globalmap_stamp;
+
+  // initial pose from /set_map, held until the 3D map with pending_stamp is loaded
+  geometry_msgs::PoseWithCovarianceStampedConstPtr pending_pose;
+  ros::Time pending_stamp;
   pcl::Filter<PointT>::Ptr downsample_filter;
   pcl::Registration<PointT, PointT>::Ptr registration;
 
