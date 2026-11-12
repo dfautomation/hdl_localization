@@ -95,7 +95,6 @@ private:
     std::string reg_method = private_nh.param<std::string>("reg_method", "NDT_OMP");
     std::string ndt_neighbor_search_method = private_nh.param<std::string>("ndt_neighbor_search_method", "DIRECT7");
     double ndt_neighbor_search_radius = private_nh.param<double>("ndt_neighbor_search_radius", 2.0);
-    double ndt_resolution = private_nh.param<double>("ndt_resolution", 1.0);
 
     if(reg_method == "NDT_OMP") {
       NODELET_INFO("NDT_OMP is selected");
@@ -150,7 +149,8 @@ private:
 
   void initialize_params() {
     // intialize scan matching method
-    double downsample_resolution = private_nh.param<double>("downsample_resolution", 0.1);
+    ndt_resolution = private_nh.param<double>("ndt_resolution", 1.0);
+    downsample_resolution = private_nh.param<double>("downsample_resolution", 0.1);
     boost::shared_ptr<pcl::VoxelGrid<PointT>> voxelgrid(new pcl::VoxelGrid<PointT>());
     voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
     downsample_filter = voxelgrid;
@@ -172,6 +172,27 @@ private:
         private_nh.param<double>("cool_time_duration", 0.5)
       ));
     }
+  }
+
+  /**
+   * @brief NDT and scan downsampling resolutions from the resolution of the raw map (= 3D map voxel size).
+   *        The caller holds pose_estimator_mutex and sets the target of the new registration.
+   * @return false when unchanged (res <= 0: no map info)
+   */
+  bool set_resolution(double res) {
+    // 5x the voxel size: ndt_omp drops NDT cells with fewer than 6 map points
+    if(res <= 0.0 || (res == downsample_resolution && 5.0 * res == ndt_resolution)) {
+      return false;
+    }
+    ndt_resolution = 5.0 * res;
+    downsample_resolution = res;
+    NODELET_INFO_STREAM("ndt_resolution " << ndt_resolution << ", downsample_resolution " << downsample_resolution);
+    boost::shared_ptr<pcl::VoxelGrid<PointT>> voxelgrid(new pcl::VoxelGrid<PointT>());
+    voxelgrid->setLeafSize(downsample_resolution, downsample_resolution, downsample_resolution);
+    downsample_filter = voxelgrid;
+    registration = create_registration();
+    delta_estimater.reset(new DeltaEstimater(create_registration()));
+    return true;
   }
 
 private:
@@ -218,6 +239,8 @@ private:
         return;
     }
 
+    // held from here: /set_map may swap downsample_filter and delta_estimater
+    std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
     auto filtered = downsample(cloud);
     last_scan = filtered;
 
@@ -225,7 +248,6 @@ private:
       delta_estimater->add_frame(filtered);
     }
 
-    std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
     if(!pose_estimator) {
       NODELET_ERROR_THROTTLE(10.0, "waiting for initial pose input!!");
       return;
@@ -315,6 +337,9 @@ private:
     {
       // a scan may be being matched against the old map in points_callback
       std::lock_guard<std::mutex> lock(pose_estimator_mutex);
+      if(points_msg->header.stamp == pending_stamp) {
+        set_resolution(pending_resolution);  // the resolution of /set_map goes with its own 3D map only
+      }
       globalmap = cloud;
       registration->setInputTarget(globalmap);
     }
@@ -413,9 +438,14 @@ private:
   bool set_map(nav_msgs::SetMap::Request& req, nav_msgs::SetMap::Response& res) {
     pending_pose = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(req.initial_pose);
     pending_stamp = req.map.header.stamp;
+    pending_resolution = req.map.info.resolution;
     {
       std::lock_guard<std::mutex> lock(pose_estimator_mutex);
       pose_estimator.reset();  // not localized until the pose is applied
+      // 3D map of this raw map already loaded: rebuild it now; otherwise globalmap_callback does
+      if(globalmap_stamp == pending_stamp && set_resolution(pending_resolution) && globalmap) {
+        registration->setInputTarget(globalmap);
+      }
     }
     apply_pending_pose();
     res.success = true;  // accepted; applied once the matching 3D map is here
@@ -611,6 +641,9 @@ private:
   // initial pose from /set_map, held until the 3D map with pending_stamp is loaded
   geometry_msgs::PoseWithCovarianceStampedConstPtr pending_pose;
   ros::Time pending_stamp;
+  double pending_resolution = 0.0;
+  double ndt_resolution;
+  double downsample_resolution;
   pcl::Filter<PointT>::Ptr downsample_filter;
   pcl::Registration<PointT, PointT>::Ptr registration;
 
